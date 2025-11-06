@@ -11,6 +11,8 @@
 #include <vtkIntArray.h>
 #include <vtkCellData.h>
 #include <vtkXMLPolyDataWriter.h>
+#include <vtkWindowedSincPolyDataFilter.h>
+#include <vtkDecimatePro.h>
 
 #include <set>
 #include <vector>
@@ -132,8 +134,28 @@ void MaskReMesh::BuildFromMask(vtkImageData* maskImage, unsigned int numThreadsO
             mc->ComputeNormalsOn();
             mc->Update();
 
-            vtkSmartPointer<vtkPolyData> surface = vtkSmartPointer<vtkPolyData>::New();
-            surface->ShallowCopy(mc->GetOutput());
+            vtkSmartPointer<vtkWindowedSincPolyDataFilter> smoother =
+                vtkSmartPointer<vtkWindowedSincPolyDataFilter>::New();
+            smoother->SetInputConnection(mc->GetOutputPort());
+            smoother->SetNumberOfIterations(20);     // 平滑迭代次数（可调）
+            smoother->BoundarySmoothingOff();        // 不平滑边界
+            smoother->FeatureEdgeSmoothingOff();     // 保留特征边
+            smoother->SetFeatureAngle(120.0);        // 角度阈值
+            smoother->SetPassBand(0.1);              // 控制保留细节程度，越小越平滑
+            smoother->NormalizeCoordinatesOn();      // 防止过度平滑导致网格塌陷
+            smoother->Update();
+
+            vtkSmartPointer<vtkPolyData> surface =
+                vtkSmartPointer<vtkPolyData>::New();
+
+            vtkSmartPointer<vtkDecimatePro> decimate =
+                vtkSmartPointer<vtkDecimatePro>::New();
+            decimate->SetInputConnection(smoother->GetOutputPort());
+            decimate->SetTargetReduction(0.05); // 保留 95% 三角形
+            decimate->PreserveTopologyOn();
+            decimate->Update();
+
+            surface->ShallowCopy(decimate->GetOutput());
 
             if (surface->GetNumberOfPoints() == 0) {
                 auto end = high_resolution_clock::now();
