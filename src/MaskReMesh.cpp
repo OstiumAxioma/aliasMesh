@@ -1,4 +1,3 @@
-// src/MaskReMesh.cpp
 #include "MaskReMesh.h"
 
 #include <vtkImageData.h>
@@ -20,11 +19,17 @@
 #include <thread>
 #include <mutex>
 #include <atomic>
+#include <algorithm>
 
 MaskReMesh::MaskReMesh() {}
 MaskReMesh::~MaskReMesh() {}
 
 void MaskReMesh::BuildFromMask(vtkImageData* maskImage)
+{
+    BuildFromMask(maskImage, 0); // 0 = 自动线程数
+}
+
+void MaskReMesh::BuildFromMask(vtkImageData* maskImage, unsigned int numThreadsOverride)
 {
     using namespace std;
     using namespace std::chrono;
@@ -54,14 +59,10 @@ void MaskReMesh::BuildFromMask(vtkImageData* maskImage)
         return;
     }
 
-    // 收集所有出现过的正整数 label
     set<int> labelSet;
     for (vtkIdType i = 0; i < numTuples; ++i) {
-        double v = scalars->GetTuple1(i);
-        int label = static_cast<int>(v);
-        if (label > 0) {
-            labelSet.insert(label);
-        }
+        int label = static_cast<int>(scalars->GetTuple1(i));
+        if (label > 0) labelSet.insert(label);
     }
 
     if (labelSet.empty()) {
@@ -72,56 +73,52 @@ void MaskReMesh::BuildFromMask(vtkImageData* maskImage)
     double origin[3] = { 0.0, 0.0, 0.0 };
     maskImage->GetOrigin(origin);
 
-    cout << "[MaskReMesh] Found " << labelSet.size() << " labels." << endl;
-
-    // 把 set 拷贝成 vector，方便按 index 分发任务
     vector<int> labels(labelSet.begin(), labelSet.end());
-
-    // 线程安全地写入 Meshes & 输出 log
-    mutex meshesMutex;
-    mutex logMutex;
-
-    // 全局任务索引
+    mutex meshesMutex, logMutex;
     atomic<size_t> nextIndex(0);
 
-    // 线程数：不小于 1
-    unsigned int hw = thread::hardware_concurrency();
-    unsigned int numThreads = hw > 0 ? hw : 4;
-    if (numThreads > labels.size()) {
-        numThreads = static_cast<unsigned int>(labels.size());
-    }
-    if (numThreads == 0) {
-        // 理论上不会到这里，因为上面已判断 labelSet.empty()
-        return;
+    unsigned int hw = std::thread::hardware_concurrency();
+    unsigned int numThreads = 0;
+
+    // 判断是否用户指定
+    bool userOverride = (numThreadsOverride > 0);
+
+    if (userOverride) {
+        numThreads = numThreadsOverride;
+    } else {
+        numThreads = (hw > 0 ? hw : 4);
     }
 
-    cout << "[MaskReMesh] Using " << numThreads
-         << " worker threads for " << labels.size() << " labels." << endl;
+    // 限制不超过标签数
+    numThreads = std::min<unsigned int>(numThreads, static_cast<unsigned int>(labels.size()));
+    if (numThreads == 0) numThreads = 1;
 
-    // 总计时开始
+    // 输出详细信息
+    std::cout << "[MaskReMesh] Detected CPU cores: " 
+            << (hw > 0 ? std::to_string(hw) : "unknown")
+            << ", thread count set to: " << numThreads
+            << (userOverride ? " (user override)" : " (auto-detected)")
+            << std::endl;
+    std::cout << "[MaskReMesh] Processing " << labels.size() << " label(s)..." << std::endl;
+
+
     auto globalStart = high_resolution_clock::now();
 
     auto worker = [&](unsigned int workerId)
     {
         while (true) {
             size_t idx = nextIndex.fetch_add(1);
-            if (idx >= labels.size()) {
-                break; // 没有更多任务
-            }
+            if (idx >= labels.size()) break;
 
             int label = labels[idx];
-
             auto start = high_resolution_clock::now();
 
             {
                 lock_guard<mutex> lock(logMutex);
-                cout << "[MaskReMesh][T" << workerId
-                     << "] Processing label = " << label << endl;
+                cout << "[T" << workerId << "] Start label " << label << endl;
             }
 
-            // === threshold + marching cubes ===
-            vtkSmartPointer<vtkImageThreshold> threshold =
-                vtkSmartPointer<vtkImageThreshold>::New();
+            vtkSmartPointer<vtkImageThreshold> threshold = vtkSmartPointer<vtkImageThreshold>::New();
             threshold->SetInputData(maskImage);
             threshold->ThresholdBetween(label, label);
             threshold->SetInValue(1);
@@ -129,151 +126,86 @@ void MaskReMesh::BuildFromMask(vtkImageData* maskImage)
             threshold->SetOutputScalarTypeToUnsignedChar();
             threshold->Update();
 
-            vtkSmartPointer<vtkMarchingCubes> mc =
-                vtkSmartPointer<vtkMarchingCubes>::New();
+            vtkSmartPointer<vtkMarchingCubes> mc = vtkSmartPointer<vtkMarchingCubes>::New();
             mc->SetInputConnection(threshold->GetOutputPort());
             mc->SetValue(0, 0.5);
             mc->ComputeNormalsOn();
             mc->Update();
 
-            vtkSmartPointer<vtkPolyData> surface =
-                vtkSmartPointer<vtkPolyData>::New();
+            vtkSmartPointer<vtkPolyData> surface = vtkSmartPointer<vtkPolyData>::New();
             surface->ShallowCopy(mc->GetOutput());
 
             if (surface->GetNumberOfPoints() == 0) {
                 auto end = high_resolution_clock::now();
-                double seconds = duration_cast<duration<double>>(end - start).count();
+                double t = duration_cast<duration<double>>(end - start).count();
                 lock_guard<mutex> lock(logMutex);
-                cout << "[MaskReMesh][T" << workerId
-                     << "] Label " << label
-                     << " produced empty surface, skip. (" << seconds << " s)"
-                     << endl;
+                cout << "[T" << workerId << "] Label " << label << " empty (" << t << " s)" << endl;
                 continue;
             }
 
             vtkIdType numCells = surface->GetNumberOfCells();
-            vtkSmartPointer<vtkIntArray> labelArray =
-                vtkSmartPointer<vtkIntArray>::New();
+            vtkSmartPointer<vtkIntArray> labelArray = vtkSmartPointer<vtkIntArray>::New();
             labelArray->SetName("Label");
-            labelArray->SetNumberOfComponents(1);
             labelArray->SetNumberOfTuples(numCells);
-            for (vtkIdType c = 0; c < numCells; ++c) {
+            for (vtkIdType c = 0; c < numCells; ++c)
                 labelArray->SetValue(c, label);
-            }
             surface->GetCellData()->AddArray(labelArray);
             surface->GetCellData()->SetActiveScalars("Label");
 
-            MeshObject obj;
-            obj.label = label;
-            obj.polyData = surface;
-            obj.origin[0] = origin[0];
-            obj.origin[1] = origin[1];
-            obj.origin[2] = origin[2];
-
-            // 把结果塞进 Meshes，需要加锁
+            MeshObject obj{ label, surface, {origin[0], origin[1], origin[2]} };
             {
                 lock_guard<mutex> lock(meshesMutex);
                 Meshes.push_back(obj);
             }
 
             auto end = high_resolution_clock::now();
-            double seconds = duration_cast<duration<double>>(end - start).count();
-            {
-                lock_guard<mutex> lock(logMutex);
-                cout << "[MaskReMesh][T" << workerId
-                     << "] Label " << label
-                     << " finished in " << seconds << " s" << endl;
-            }
+            double t = duration_cast<duration<double>>(end - start).count();
+            lock_guard<mutex> lock(logMutex);
+            cout << "[T" << workerId << "] Label " << label << " done (" << t << " s)" << endl;
         }
     };
 
-    // 启动线程
-    vector<thread> workers;
-    workers.reserve(numThreads);
-    for (unsigned int i = 0; i < numThreads; ++i) {
-        workers.emplace_back(worker, i);
-    }
+    vector<thread> threads;
+    for (unsigned int i = 0; i < numThreads; ++i)
+        threads.emplace_back(worker, i);
+    for (auto& t : threads)
+        t.join();
 
-    // 等待全部线程结束
-    for (auto& th : workers) {
-        if (th.joinable()) {
-            th.join();
-        }
-    }
-
-    // 总耗时
     auto globalEnd = high_resolution_clock::now();
-    double totalSeconds =
-        duration_cast<duration<double>>(globalEnd - globalStart).count();
-
-    // Meshes 的顺序可能与 labelSet 遍历顺序不同（多线程插入），但每个 MeshObject 的 label 正确
-    {
-        lock_guard<mutex> lock(logMutex);
-        cout << "[MaskReMesh] Total " << Meshes.size()
-             << " labels processed in " << totalSeconds << " s" << endl;
-    }
+    double total = duration_cast<duration<double>>(globalEnd - globalStart).count();
+    cout << "[MaskReMesh] Total " << Meshes.size() << " labels processed in "
+         << total << " s" << endl;
 }
 
 bool MaskReMesh::ExportToStl(const std::string& filePath) const
 {
-    using namespace std;
-
-    if (Meshes.empty()) {
-        cerr << "[MaskReMesh] No meshes to export." << endl;
-        return false;
-    }
-
-    vtkSmartPointer<vtkAppendPolyData> append =
-        vtkSmartPointer<vtkAppendPolyData>::New();
-
-    for (size_t i = 0; i < Meshes.size(); ++i) {
-        if (!Meshes[i].polyData)
-            continue;
-        append->AddInputData(Meshes[i].polyData);
-    }
+    if (Meshes.empty()) return false;
+    vtkSmartPointer<vtkAppendPolyData> append = vtkSmartPointer<vtkAppendPolyData>::New();
+    for (const auto& m : Meshes)
+        if (m.polyData) append->AddInputData(m.polyData);
     append->Update();
-
-    vtkSmartPointer<vtkSTLWriter> writer =
-        vtkSmartPointer<vtkSTLWriter>::New();
+    auto writer = vtkSmartPointer<vtkSTLWriter>::New();
     writer->SetFileName(filePath.c_str());
     writer->SetInputConnection(append->GetOutputPort());
     writer->SetFileTypeToBinary();
     writer->Write();
-
     return true;
 }
 
 bool MaskReMesh::ExportToVTP(const std::string& filePath) const
 {
-    using namespace std;
-
-    if (Meshes.empty()) {
-        cerr << "[MaskReMesh] No meshes to export." << endl;
-        return false;
-    }
-
-    vtkSmartPointer<vtkAppendPolyData> append =
-        vtkSmartPointer<vtkAppendPolyData>::New();
-
-    for (size_t i = 0; i < Meshes.size(); ++i)
-    {
-        if (!Meshes[i].polyData)
-            continue;
-        append->AddInputData(Meshes[i].polyData);
-    }
+    if (Meshes.empty()) return false;
+    vtkSmartPointer<vtkAppendPolyData> append = vtkSmartPointer<vtkAppendPolyData>::New();
+    for (const auto& m : Meshes)
+        if (m.polyData) append->AddInputData(m.polyData);
     append->Update();
-
-    vtkSmartPointer<vtkXMLPolyDataWriter> writer =
-        vtkSmartPointer<vtkXMLPolyDataWriter>::New();
+    auto writer = vtkSmartPointer<vtkXMLPolyDataWriter>::New();
     writer->SetFileName(filePath.c_str());
     writer->SetInputConnection(append->GetOutputPort());
     writer->SetDataModeToBinary();
     writer->EncodeAppendedDataOff();
     writer->Write();
-
-    cout << "[MaskReMesh] Exported VTP with "
-         << Meshes.size() << " label meshes -> "
-         << filePath << endl;
-
+    std::cout << "[MaskReMesh] Exported VTP with "
+              << Meshes.size() << " label meshes -> " << filePath << std::endl;
     return true;
 }

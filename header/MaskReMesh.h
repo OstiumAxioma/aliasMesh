@@ -3,7 +3,6 @@
 
 #include <vector>
 #include <string>
-
 #include <vtkSmartPointer.h>
 
 class vtkImageData;
@@ -22,16 +21,13 @@ public:
     MaskReMesh();
     ~MaskReMesh();
 
-    // 类函数1：传入 NIfTI 掩码图像指针，根据掩码生成每个 label 对应的 PolyData
-    // 内部使用多线程，并打印：
-    //  - 每个 label 的耗时
-    //  - 全部 labels 的总耗时
+    // 自动线程数版本
     void BuildFromMask(vtkImageData* maskImage);
 
-    // 类函数2：导出为 STL（所有掩码合并为一个 STL，不带颜色）
-    bool ExportToStl(const std::string& filePath) const;
+    // 可自定义线程数版本（numThreads=1 表示单线程，=0 表示自动）
+    void BuildFromMask(vtkImageData* maskImage, unsigned int numThreadsOverride);
 
-    // 导出为 VTP（PolyData XML，保留 Label 标量用于上色）
+    bool ExportToStl(const std::string& filePath) const;
     bool ExportToVTP(const std::string& filePath) const;
 
     const std::vector<MeshObject>& GetMeshes() const { return Meshes; }
