@@ -1,4 +1,3 @@
-// src/MaskReMesh.cpp
 #include "MaskReMesh.h"
 
 #include <vtkImageData.h>
@@ -13,15 +12,17 @@
 #include <vtkCellData.h>
 #include <vtkXMLPolyDataWriter.h>
 
-
 #include <set>
 #include <iostream>
+#include <chrono>   // ✅ 计时头文件
 
 MaskReMesh::MaskReMesh() {}
 MaskReMesh::~MaskReMesh() {}
 
 void MaskReMesh::BuildFromMask(vtkImageData* maskImage)
 {
+    using namespace std::chrono;
+
     Meshes.clear();
 
     if (!maskImage) {
@@ -47,7 +48,7 @@ void MaskReMesh::BuildFromMask(vtkImageData* maskImage)
         return;
     }
 
-    // 收集所有出现过的正整数 label（一个 label 视为一个掩码 indice）
+    // 收集所有出现过的正整数 label
     std::set<int> labelSet;
     for (vtkIdType i = 0; i < numTuples; ++i) {
         double v = scalars->GetTuple1(i);
@@ -67,17 +68,22 @@ void MaskReMesh::BuildFromMask(vtkImageData* maskImage)
 
     std::cout << "[MaskReMesh] Found " << labelSet.size() << " labels." << std::endl;
 
-    // 对每一个 label 做一次阈值分割 + MarchingCubes，生成独立的 PolyData
+    // ✅ 开始总计时
+    auto globalStart = high_resolution_clock::now();
+
+    // 每个 label 的处理
     for (std::set<int>::const_iterator it = labelSet.begin();
          it != labelSet.end(); ++it)
     {
         int label = *it;
         std::cout << "[MaskReMesh] Processing label = " << label << std::endl;
 
+        auto start = high_resolution_clock::now();
+
         vtkSmartPointer<vtkImageThreshold> threshold =
             vtkSmartPointer<vtkImageThreshold>::New();
         threshold->SetInputData(maskImage);
-        threshold->ThresholdBetween(label, label); // 只保留当前 label
+        threshold->ThresholdBetween(label, label);
         threshold->SetInValue(1);
         threshold->SetOutValue(0);
         threshold->SetOutputScalarTypeToUnsignedChar();
@@ -86,7 +92,7 @@ void MaskReMesh::BuildFromMask(vtkImageData* maskImage)
         vtkSmartPointer<vtkMarchingCubes> mc =
             vtkSmartPointer<vtkMarchingCubes>::New();
         mc->SetInputConnection(threshold->GetOutputPort());
-        mc->SetValue(0, 0.5);   // 二值图像：0 / 1，在 0.5 处取等值面
+        mc->SetValue(0, 0.5);
         mc->ComputeNormalsOn();
         mc->Update();
 
@@ -100,7 +106,6 @@ void MaskReMesh::BuildFromMask(vtkImageData* maskImage)
             continue;
         }
 
-        // 给每个 cell 写入一个整型标量 “Label”，方便后续按 label 上色
         vtkIdType numCells = surface->GetNumberOfCells();
         vtkSmartPointer<vtkIntArray> labelArray =
             vtkSmartPointer<vtkIntArray>::New();
@@ -121,9 +126,20 @@ void MaskReMesh::BuildFromMask(vtkImageData* maskImage)
         obj.origin[2] = origin[2];
 
         Meshes.push_back(obj);
+
+        // ✅ 单个 label 耗时
+        auto end = high_resolution_clock::now();
+        double seconds = duration_cast<duration<double>>(end - start).count();
+        std::cout << "[MaskReMesh] Label " << label
+                  << " finished in " << seconds << " s" << std::endl;
     }
 
-    std::cout << "[MaskReMesh] Total meshes = " << Meshes.size() << std::endl;
+    // ✅ 总耗时
+    auto globalEnd = high_resolution_clock::now();
+    double totalSeconds = duration_cast<duration<double>>(globalEnd - globalStart).count();
+
+    std::cout << "[MaskReMesh] Total " << Meshes.size()
+              << " labels processed in " << totalSeconds << " s" << std::endl;
 }
 
 bool MaskReMesh::ExportToStl(const std::string& filePath) const
@@ -133,14 +149,12 @@ bool MaskReMesh::ExportToStl(const std::string& filePath) const
         return false;
     }
 
-    // 将所有 label 的 PolyData 合并成一个 PolyData，输出一个 STL 文件
     vtkSmartPointer<vtkAppendPolyData> append =
         vtkSmartPointer<vtkAppendPolyData>::New();
 
     for (std::size_t i = 0; i < Meshes.size(); ++i) {
-        if (!Meshes[i].polyData) {
+        if (!Meshes[i].polyData)
             continue;
-        }
         append->AddInputData(Meshes[i].polyData);
     }
     append->Update();
@@ -149,14 +163,9 @@ bool MaskReMesh::ExportToStl(const std::string& filePath) const
         vtkSmartPointer<vtkSTLWriter>::New();
     writer->SetFileName(filePath.c_str());
     writer->SetInputConnection(append->GetOutputPort());
-    writer->SetFileTypeToBinary();  // 二进制 STL，体积小一点
+    writer->SetFileTypeToBinary();
     writer->Write();
 
-    // 说明：
-    //   标准 STL 格式本身不保存颜色或标量信息，
-    //   上面写进去的 cell 标量 "Label" 在导出 STL 时会丢失。
-    //   “每个掩码网格上色”这一点通常需要在 VTK / 3D 程序中加载后，
-    //   再根据 label 做 LUT 上色（例如使用附加的 .vtp 写入带标量的 PolyData）。
     return true;
 }
 
@@ -167,7 +176,6 @@ bool MaskReMesh::ExportToVTP(const std::string& filePath) const
         return false;
     }
 
-    // 将所有 label 的 PolyData 合并成一个多块数据（每个 cell 有标量 "Label"）
     vtkSmartPointer<vtkAppendPolyData> append =
         vtkSmartPointer<vtkAppendPolyData>::New();
 
@@ -183,7 +191,7 @@ bool MaskReMesh::ExportToVTP(const std::string& filePath) const
         vtkSmartPointer<vtkXMLPolyDataWriter>::New();
     writer->SetFileName(filePath.c_str());
     writer->SetInputConnection(append->GetOutputPort());
-    writer->SetDataModeToBinary();  // 压缩但保留标量数据
+    writer->SetDataModeToBinary();
     writer->EncodeAppendedDataOff();
     writer->Write();
 
